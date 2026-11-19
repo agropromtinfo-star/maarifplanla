@@ -1,0 +1,984 @@
+import * as XLSX from "xlsx";
+import mammoth from "mammoth";
+import { getDocumentProxy } from "unpdf";
+import {
+  MaarifLessonPlan,
+  YillikPlanWeekItem,
+  DocumentHeaderFooterMeta,
+} from "../types/lessonPlan";
+import {
+  stripFrontMatter,
+  extractCleanDocumentMetadata,
+  parseDersBilgiFormuStructured,
+  extractWeekPlanStructured,
+  extractWeekMateryalSlice,
+  enforceAndMergeLessonPlan,
+  resolveValidDateRange,
+  cleanPdfHeaderFooterNoiseFromField,
+  sanitizePlanOutputBeforeDelivery,
+  extractAllWeekAnchorsFromYillikPlan,
+  sanitizeAndEnforceSingleUnit,
+  repairIncompleteTopic,
+  isDbfHeaderOrTableNoise,
+  StructuredDersBilgiFormu,
+  WeekSpecificExtraction,
+} from "../shared/maarifPlanEngine";
+
+const TURKISH_MONTHS: Record<string, string> = {
+  ocak: "01",
+  şubat: "02",
+  subat: "02",
+  mart: "03",
+  nisan: "04",
+  mayıs: "05",
+  mayis: "05",
+  haziran: "06",
+  temmuz: "07",
+  ağustos: "08",
+  agustos: "08",
+  eylül: "09",
+  eylul: "09",
+  ekim: "10",
+  kasım: "11",
+  kasim: "11",
+  aralık: "12",
+  aralik: "12",
+};
+
+export function inferApprovalDateClient(
+  dateRange: string,
+  defaultYear = 2026
+): string {
+  const lower = (dateRange || "").toLocaleLowerCase("tr-TR");
+  const numericDateMatch = lower.match(
+    /\b(\d{1,2})[./](\d{1,2})(?:[./](20\d{2}))?/
+  );
+  if (numericDateMatch) {
+    const d = numericDateMatch[1].padStart(2, "0");
+    const m = numericDateMatch[2].padStart(2, "0");
+    const y =
+      numericDateMatch[3] ||
+      (Number(m) >= 9 ? String(defaultYear) : String(defaultYear + 1));
+    return `${d}/${m}/${y}`;
+  }
+  const dayMatch = lower.match(/(\d{1,2})/);
+  const day = dayMatch ? dayMatch[1].padStart(2, "0") : "01";
+  for (const [mName, mNum] of Object.entries(TURKISH_MONTHS)) {
+    if (lower.includes(mName)) {
+      const year = Number(mNum) >= 9 ? defaultYear : defaultYear + 1;
+      return `${day}/${mNum}/${year}`;
+    }
+  }
+  return "";
+}
+
+export function stripDocumentFrontMatter(rawText: string): string {
+  return stripFrontMatter(rawText);
+}
+
+export function extractDocumentMetadataClient(text: string): {
+  okulAdi: string;
+  dersIsmi: string;
+  sinifDuzeyi: string;
+} {
+  // Course metadata (school, course name, grade level) is always in the document header / first pages
+  const headerSlice = (text || "").slice(0, 18000);
+  const meta = extractCleanDocumentMetadata(headerSlice);
+  return {
+    okulAdi: meta.okulAdi,
+    dersIsmi: meta.dersIsmi,
+    sinifDuzeyi: meta.sinifDuzeyi,
+  };
+}
+
+const QUICK_WEEKS_CACHE = new Map<string, YillikPlanWeekItem[]>();
+
+export function clearQuickWeeksCache(): void {
+  QUICK_WEEKS_CACHE.clear();
+}
+
+export function parseQuickWeeksClient(
+  text: string,
+  dersBilgiFormuText = "",
+  dersMateryaliText = ""
+): YillikPlanWeekItem[] {
+  if (!text || !text.trim()) return [];
+  const cacheKey = `${text.length}:${text.slice(0, 120)}:${text.slice(-80)}:${dersBilgiFormuText.length}:${dersMateryaliText.length}`;
+  const cached = QUICK_WEEKS_CACHE.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const cleanYillik = stripFrontMatter((text || "").slice(0, 250000));
+  const lines = cleanYillik
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  if (lines.length === 0) return [];
+
+  // Parse structured DBF/Materyal + Yıllık Plan so unitsByNumber and outcomesMap reflect the current course
+  const structuredDbf = parseDersBilgiFormuStructured(
+    dersBilgiFormuText || "",
+    cleanYillik,
+    dersMateryaliText || ""
+  );
+
+  // Extract all week anchors (including split multi-line weeks, glued tokens, and gap-recovered weeks)
+  const anchors = extractAllWeekAnchorsFromYillikPlan(lines);
+
+  const weeks: YillikPlanWeekItem[] = [];
+  let activeUnitCarryover = "";
+  let activeOutcomeCarryover = "";
+
+  for (let idx = 0; idx < anchors.length; idx++) {
+    const anchor = anchors[idx];
+    const wNo = anchor.weekNo;
+    const validDateRange = resolveValidDateRange(anchor.dateRange, wNo);
+
+    // Extract exact week-specific outcome, sub-components, unit, and topic using the structured engine
+    const weekSpecific = extractWeekPlanStructured(
+      cleanYillik,
+      `${wNo}. HAFTA`,
+      validDateRange,
+      structuredDbf
+    );
+
+    const isSpecial = Boolean(weekSpecific.isSpecialWeek);
+    const displayOutcome = isSpecial
+      ? weekSpecific.outcomeHeader || weekSpecific.ogrenmeBirimi
+      : weekSpecific.outcomeHeader || activeOutcomeCarryover;
+    if (!isSpecial && weekSpecific.outcomeHeader) {
+      activeOutcomeCarryover = weekSpecific.outcomeHeader;
+    } else if (isSpecial) {
+      activeOutcomeCarryover = "";
+    }
+
+    const rawUnit = isSpecial
+      ? weekSpecific.ogrenmeBirimi
+      : weekSpecific.ogrenmeBirimi || activeUnitCarryover;
+    if (!isSpecial && weekSpecific.ogrenmeBirimi) {
+      activeUnitCarryover = weekSpecific.ogrenmeBirimi;
+    } else if (isSpecial) {
+      activeUnitCarryover = "";
+    }
+
+    const sanitizedUnit = isSpecial
+      ? rawUnit
+      : sanitizeAndEnforceSingleUnit(rawUnit || "", {
+          knownUnits: structuredDbf.unitsByNumber,
+          outcomeHeader: displayOutcome,
+          outcomeCode: weekSpecific.outcomeCode,
+          icerikCercevesi: weekSpecific.icerikCercevesi,
+          weekNo: wNo,
+        });
+
+    const repairedTopic = isSpecial
+      ? (weekSpecific.icerikCercevesi || sanitizedUnit)
+      : repairIncompleteTopic(weekSpecific.icerikCercevesi || "", {
+          rawWeekWindowText: weekSpecific.rawWeekWindowText,
+          yillikPlan: cleanYillik,
+          structuredDbf,
+          outcomeHeader: displayOutcome,
+          ogrenmeBirimi: sanitizedUnit,
+          weekNo: wNo,
+        });
+
+    // Build week-specific summary showing the outcome and THIS week's specific sub-components
+    const weekSubs = isSpecial
+      ? []
+      : weekSpecific.weekSubComponents.filter((s) => s.length >= 4);
+    const meaningfulSummary = isSpecial
+      ? weekSpecific.formattedOutcomeAndProcessBlock ||
+        repairedTopic ||
+        sanitizedUnit
+      : displayOutcome
+      ? weekSubs.length > 0
+        ? [displayOutcome, ...weekSubs.slice(0, 3)].join("\n")
+        : repairedTopic
+        ? `${displayOutcome} — ${repairedTopic}`
+        : displayOutcome
+      : weekSubs.length > 0
+      ? weekSubs.slice(0, 3).join("\n")
+      : repairedTopic || "";
+
+    weeks.push({
+      id: `week-${wNo}`,
+      haftaNo: wNo,
+      haftaEtiketi: `${wNo}. HAFTA`,
+      tarihAraligi: validDateRange,
+      onayTarihi: inferApprovalDateClient(validDateRange),
+      ogrenmeBirimi: sanitizedUnit || "",
+      icerikCercevesi: repairedTopic || "",
+      konuVeCiktiOzeti: meaningfulSummary.slice(0, 260),
+      sure: weekSpecific.sure || structuredDbf.sure || "2 Ders Saati",
+      ogrenmeKanitlari: isSpecial
+        ? ""
+        : weekSpecific.unitOgrenmeKanitlari || structuredDbf.ogrenmeKanitlari || "",
+      ogretmeUygulamalari: isSpecial
+        ? []
+        : weekSpecific.unitOgretmeUygulamalari || [],
+    });
+  }
+
+  const sorted = weeks.sort((a, b) => a.haftaNo - b.haftaNo);
+  if (QUICK_WEEKS_CACHE.size > 15) {
+    const firstKey = QUICK_WEEKS_CACHE.keys().next().value;
+    if (firstKey) QUICK_WEEKS_CACHE.delete(firstKey);
+  }
+  QUICK_WEEKS_CACHE.set(cacheKey, sorted);
+  return sorted;
+}
+
+function extractLegacyDocText(buffer: ArrayBuffer): string {
+  const decoderUtf8 = new TextDecoder("utf-8", { fatal: false });
+  const rawUtf8 = decoderUtf8.decode(buffer);
+
+  if (/<html|<table|<body|<p\b|<w:/i.test(rawUtf8)) {
+    const stripped = rawUtf8
+      .replace(/<style[\s\S]*?<\/style>/gi, " ")
+      .replace(/<script[\s\S]*?<\/script>/gi, " ")
+      .replace(/<\/(tr|p|div|li|h[1-6])>/gi, "\n")
+      .replace(/<\/(td|th)>/gi, " | ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/&nbsp;/gi, " ")
+      .replace(/&amp;/gi, "&")
+      .replace(/[ \t]+/g, " ")
+      .replace(/\n\s*\n+/g, "\n")
+      .trim();
+    if (stripped.length > 20) return stripped;
+  }
+
+  const printableChunks =
+    rawUtf8.match(/[A-Za-z0-9ÇĞİÖŞÜçğıöşü.,;:!?()[\]\-–/\s]{6,}/g) || [];
+  const cleaned = printableChunks
+    .map((c) => c.trim())
+    .filter((c) => c.length >= 6 && /[A-Za-zÇĞİÖŞÜçğıöşü]{3,}/.test(c))
+    .join("\n");
+
+  return cleaned.trim();
+}
+
+export interface ClientExtractionResult {
+  text: string;
+  quickWeeks: YillikPlanWeekItem[];
+  detectedMeta: {
+    okulAdi: string;
+    dersIsmi: string;
+    sinifDuzeyi: string;
+  };
+  method: "client" | "server";
+  totalPages?: number;
+}
+
+export interface ExtractFileOptions {
+  fieldKey?: "yillik_plan" | "ders_bilgi_formu" | "ders_materyali";
+  onProgress?: (statusText: string) => void;
+}
+
+/**
+ * Non-blocking chunked PDF text extractor.
+ * Processes pages sequentially inside small UI-yielding batches so each page gets its full timeout budget
+ * (preventing Promise.all timer starvation from dropping pages), cleans up page proxies immediately,
+ * and yields to the browser UI thread so the tab never freezes ("Sayfa Yanıt Vermiyor").
+ */
+async function extractPdfTextChunkedNonBlocking(
+  uint8: Uint8Array,
+  onProgress?: (statusText: string) => void,
+  maxTotalChars = 600000
+): Promise<{ text: string; totalPages: number }> {
+  onProgress?.("PDF yapısı hazırlanıyor...");
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  const pdf = await getDocumentProxy(uint8);
+  const totalPages = pdf.numPages || 0;
+  const pageTexts: string[] = [];
+  const UI_YIELD_EVERY_PAGES = 3;
+  const PER_PAGE_TIMEOUT_MS = 5000;
+  let accumulatedChars = 0;
+
+  try {
+    onProgress?.(`PDF açıldı (${totalPages} sayfa), metin çıkarılıyor...`);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const extractSinglePageWithTimeout = async (
+      pageNo: number
+    ): Promise<string> => {
+      let pageProxy: Awaited<ReturnType<typeof pdf.getPage>> | undefined;
+      try {
+        const pagePromise = (async () => {
+          const loadedPage = await pdf.getPage(pageNo);
+          pageProxy = loadedPage;
+          const content = await loadedPage.getTextContent();
+
+          interface PositionedItem {
+            str: string;
+            x: number;
+            y: number;
+            width: number;
+            height: number;
+            hasEOL?: boolean;
+          }
+
+          const positioned: PositionedItem[] = [];
+          for (const rawItem of content.items) {
+            if (rawItem && "str" in rawItem && typeof rawItem.str === "string") {
+              const str = rawItem.str;
+              if (!str && !rawItem.hasEOL) continue;
+              const tr =
+                "transform" in rawItem && Array.isArray(rawItem.transform)
+                  ? rawItem.transform
+                  : [1, 0, 0, 1, 0, 0];
+              positioned.push({
+                str,
+                x: Number(tr[4]) || 0,
+                y: Number(tr[5]) || 0,
+                width: "width" in rawItem ? Number(rawItem.width) || 0 : 0,
+                height: "height" in rawItem ? Number(rawItem.height) || 10 : 10,
+                hasEOL: Boolean(rawItem.hasEOL),
+              });
+            }
+          }
+
+          if (positioned.length === 0) return "";
+
+          // Sort items visually top-to-bottom (Y descending) then left-to-right (X ascending)
+          positioned.sort((a, b) => {
+            if (Math.abs(a.y - b.y) > 2.5) return b.y - a.y;
+            return a.x - b.x;
+          });
+
+          const visualLines: string[] = [];
+          let currentLineY = positioned[0].y;
+          let currentLineParts: PositionedItem[] = [];
+
+          const flushLine = () => {
+            if (currentLineParts.length === 0) return;
+            currentLineParts.sort((a, b) => a.x - b.x);
+            let lineStr = "";
+            let prevEndX = currentLineParts[0].x;
+            for (let idx = 0; idx < currentLineParts.length; idx++) {
+              const part = currentLineParts[idx];
+              if (idx > 0) {
+                const gap = part.x - prevEndX;
+                const spaceThreshold = Math.max(1.2, (part.height || 10) * 0.14);
+                if (
+                  gap > spaceThreshold &&
+                  !lineStr.endsWith(" ") &&
+                  !part.str.startsWith(" ")
+                ) {
+                  lineStr += " ";
+                }
+              }
+              lineStr += part.str;
+              prevEndX = Math.max(prevEndX, part.x + part.width);
+            }
+            const cleanLine = lineStr.replace(/[^\S\n]+/g, " ").trim();
+            if (cleanLine) {
+              visualLines.push(cleanLine);
+            }
+          };
+
+          for (const item of positioned) {
+            if (Math.abs(item.y - currentLineY) <= 2.5) {
+              currentLineParts.push(item);
+            } else {
+              flushLine();
+              currentLineY = item.y;
+              currentLineParts = [item];
+            }
+          }
+          flushLine();
+
+          // Strip isolated standalone page numbers at the very top or bottom edge of the page
+          if (visualLines.length > 2 && /^\d{1,3}$/.test(visualLines[0])) {
+            visualLines.shift();
+          }
+          if (
+            visualLines.length > 2 &&
+            /^\d{1,3}$/.test(visualLines[visualLines.length - 1])
+          ) {
+            visualLines.pop();
+          }
+
+          return visualLines.join("\n").trim();
+        })();
+
+        const timeoutPromise = new Promise<string>((resolve) => {
+          setTimeout(() => resolve(""), PER_PAGE_TIMEOUT_MS);
+        });
+
+        return await Promise.race([pagePromise, timeoutPromise]);
+      } catch {
+        return "";
+      } finally {
+        try {
+          if (pageProxy && typeof pageProxy.cleanup === "function") {
+            pageProxy.cleanup();
+          }
+        } catch {
+          // ignore cleanup warnings
+        }
+      }
+    };
+
+    for (let pageNo = 1; pageNo <= totalPages; pageNo++) {
+      let pText = await extractSinglePageWithTimeout(pageNo);
+      if (!pText) {
+        // Retry once after yielding in case main thread was momentarily busy
+        await new Promise((resolve) => setTimeout(resolve, 4));
+        pText = await extractSinglePageWithTimeout(pageNo);
+      }
+
+      if (pText) {
+        pageTexts.push(pText);
+        accumulatedChars += pText.length;
+      }
+
+      if (pageNo % UI_YIELD_EVERY_PAGES === 0 || pageNo === totalPages) {
+        const pct = Math.min(
+          100,
+          Math.round((pageNo / Math.max(1, totalPages)) * 100)
+        );
+        onProgress?.(
+          `PDF okunuyor: ${pageNo} / ${totalPages} sayfa (%${pct})`
+        );
+        // Yield to browser UI event loop so React renders progress and browser never freezes
+        await new Promise((resolve) => setTimeout(resolve, 4));
+      }
+
+      if (accumulatedChars >= maxTotalChars) {
+        break;
+      }
+    }
+  } finally {
+    try {
+      await pdf.loadingTask?.destroy?.();
+    } catch {
+      // ignore destroy warnings
+    }
+  }
+
+  return {
+    text: pageTexts.join("\n\n").trim(),
+    totalPages,
+  };
+}
+
+export async function extractFileContentHybrid(
+  file: File,
+  options?: ExtractFileOptions
+): Promise<ClientExtractionResult> {
+  const lowerName = file.name.toLowerCase();
+  const fieldKey = options?.fieldKey;
+  const onProgress = options?.onProgress;
+
+  onProgress?.("Dosya belleğe alınıyor...");
+  const arrayBuffer = await file.arrayBuffer();
+  let extractedText = "";
+  let totalPages: number | undefined;
+
+  try {
+    if (lowerName.endsWith(".pdf") || file.type === "application/pdf") {
+      const uint8 = new Uint8Array(arrayBuffer);
+      const maxPdfChars = fieldKey === "ders_materyali" ? 950000 : 600000;
+      const pdfRes = await extractPdfTextChunkedNonBlocking(
+        uint8,
+        onProgress,
+        maxPdfChars
+      );
+      extractedText = pdfRes.text;
+      totalPages = pdfRes.totalPages;
+    } else if (
+      lowerName.endsWith(".docx") ||
+      file.type ===
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ) {
+      onProgress?.("Word (.docx) belgesi okunuyor...");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const result = await mammoth.extractRawText({ arrayBuffer });
+      extractedText = (result.value || "").trim();
+    } else if (
+      lowerName.endsWith(".xlsx") ||
+      lowerName.endsWith(".xls") ||
+      file.type ===
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+      file.type === "application/vnd.ms-excel"
+    ) {
+      onProgress?.("Excel tablosu okunuyor...");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const workbook = XLSX.read(arrayBuffer, { type: "array" });
+      const sheetTexts: string[] = [];
+
+      for (const sheetName of workbook.SheetNames) {
+        const sheet = workbook.Sheets[sheetName];
+        if (!sheet) continue;
+        const rows = XLSX.utils.sheet_to_json<
+          (string | number | boolean | null)[]
+        >(sheet, { header: 1, blankrows: false });
+        const formattedRows = rows
+          .map((row) =>
+            row
+              .map((cell) =>
+                cell !== null && cell !== undefined ? String(cell).trim() : ""
+              )
+              .filter(Boolean)
+              .join(" | ")
+          )
+          .filter(Boolean)
+          .join("\n");
+
+        if (formattedRows) {
+          sheetTexts.push(`--- Sayfa: ${sheetName} ---\n${formattedRows}`);
+        }
+      }
+      extractedText = sheetTexts.join("\n\n").trim();
+    } else if (lowerName.endsWith(".doc") || lowerName.endsWith(".rtf")) {
+      onProgress?.("Belge metni ayrıştırılıyor...");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      extractedText = extractLegacyDocText(arrayBuffer);
+    } else if (
+      lowerName.endsWith(".txt") ||
+      lowerName.endsWith(".md") ||
+      lowerName.endsWith(".csv") ||
+      file.type.startsWith("text/")
+    ) {
+      const decoder = new TextDecoder("utf-8", { fatal: false });
+      extractedText = decoder.decode(arrayBuffer).trim();
+    }
+  } catch (clientErr) {
+    console.warn(
+      "Client-side extraction warning, trying server fallback:",
+      clientErr
+    );
+  }
+
+  if (extractedText.length >= 25) {
+    onProgress?.("İçerik yapılandırılıyor...");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return {
+      text: extractedText,
+      // Only parse 36-week rows if this file is Yıllık Plan!
+      quickWeeks:
+        fieldKey === "yillik_plan" ? parseQuickWeeksClient(extractedText) : [],
+      detectedMeta: extractDocumentMetadataClient(extractedText),
+      method: "client",
+      totalPages,
+    };
+  }
+
+  if (file.size <= 35 * 1024 * 1024) {
+    try {
+      onProgress?.("Sunucu tabanlı metin çözümleyici çalışıyor...");
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const response = await fetch("/api/extract-file", {
+        method: "POST",
+        body: formData,
+      });
+
+      const raw = await response.text();
+      try {
+        const data = JSON.parse(raw);
+        if (response.ok && typeof data.text === "string" && data.text.trim()) {
+          const clean = data.text.trim();
+          return {
+            text: clean,
+            quickWeeks:
+              fieldKey === "yillik_plan"
+                ? Array.isArray(data.quickWeeks) && data.quickWeeks.length > 0
+                  ? data.quickWeeks
+                  : parseQuickWeeksClient(clean)
+                : [],
+            detectedMeta: extractDocumentMetadataClient(clean),
+            method: "server",
+            totalPages,
+          };
+        }
+      } catch {
+        // Non-JSON proxy response
+      }
+    } catch (serverErr) {
+      console.warn("Server fallback warning:", serverErr);
+    }
+  }
+
+  const fallbackText =
+    extractedText ||
+    `[Yüklenen Dosya: ${file.name}]\nNot: Bu dosya görsel/taranmış ağırlıklı bir doküman olarak algılandı.`;
+
+  return {
+    text: fallbackText,
+    quickWeeks:
+      fieldKey === "yillik_plan" ? parseQuickWeeksClient(fallbackText) : [],
+    detectedMeta: extractDocumentMetadataClient(fallbackText),
+    method: "client",
+    totalPages,
+  };
+}
+
+export async function safeReadJsonResponse<T = Record<string, unknown>>(
+  response: Response
+): Promise<{ ok: boolean; status: number; data: T | null; errorText?: string }> {
+  const rawText = await response.text();
+  try {
+    const parsed = JSON.parse(rawText) as T;
+    return {
+      ok: response.ok,
+      status: response.status,
+      data: parsed,
+    };
+  } catch {
+    return {
+      ok: false,
+      status: response.status,
+      data: null,
+      errorText: `Proxy/Ağ yanıtı (${response.status}): ${rawText.slice(0, 120)}`,
+    };
+  }
+}
+
+export interface XmlContextPayloadInput {
+  yillik_plan: string;
+  ders_materyali: string;
+  ders_bilgi_formu?: string;
+  hafta_etiketi: string;
+  tarih_araligi: string;
+  onay_tarihi: string;
+  okul_adi: string;
+  egitim_ogretim_yili: string;
+  ders_ismi: string;
+  sinif_duzeyi: string;
+  secilen_hafta_verisi?: YillikPlanWeekItem | null;
+  dosya_adlari?: {
+    yillik_plan?: string | null;
+    ders_materyali?: string | null;
+    ders_bilgi_formu?: string | null;
+  };
+}
+
+/**
+ * Decomposes the 3 full documents in memory using our Maarif Plan Engine and builds an
+ * explicit XML-tagged context payload (<hedef_hafta_ve_ust_bilgiler>, <yillik_plan>,
+ * <ders_bilgi_formu>, <ders_materyali>) where NO section of Ders Bilgi Formu or Yıllık Plan
+ * is ever cut off!
+ */
+export function buildXmlContextPayloadWithAnalysis(
+  input: XmlContextPayloadInput
+): {
+  xmlPayload: string;
+  structuredDbf: StructuredDersBilgiFormu;
+  weekData: WeekSpecificExtraction;
+  materyalSlice: string;
+} {
+  const structuredDbf = parseDersBilgiFormuStructured(
+    input.ders_bilgi_formu || "",
+    input.yillik_plan,
+    input.ders_materyali
+  );
+
+  const weekData = extractWeekPlanStructured(
+    input.yillik_plan,
+    input.hafta_etiketi,
+    input.tarih_araligi,
+    structuredDbf,
+    input.secilen_hafta_verisi
+  );
+
+  const materyalSlice = extractWeekMateryalSlice(
+    input.ders_materyali,
+    weekData,
+    9500
+  );
+
+  const effectiveDers = input.ders_ismi.trim() || structuredDbf.ders;
+  const effectiveSinif = input.sinif_duzeyi.trim() || structuredDbf.sinif;
+  const effectiveTarihAraligi =
+    weekData.tarihAraligi || input.tarih_araligi || "";
+  const effectiveOnayTarihi =
+    inferApprovalDateClient(effectiveTarihAraligi) || input.onay_tarihi || "";
+
+  const rawCleanYillik = stripFrontMatter(input.yillik_plan || "");
+  let cleanYillikTableSlice = rawCleanYillik.slice(0, 48000);
+  if (rawCleanYillik.length > 48000 && weekData.haftaNo >= 1) {
+    const weekAnchorMatch = rawCleanYillik.match(
+      new RegExp(`\\b${weekData.haftaNo}\\s*\\.\\s*HAFTA\\b`, "i")
+    );
+    if (weekAnchorMatch && typeof weekAnchorMatch.index === "number") {
+      const center = weekAnchorMatch.index;
+      const start = Math.max(0, center - 20000);
+      cleanYillikTableSlice = rawCleanYillik.slice(start, start + 48000);
+    }
+  }
+
+  const activeUnitMeta = !weekData.isSpecialWeek ? weekData.unitMetadata : undefined;
+  const cleanDbfSlice = (
+    (!weekData.isSpecialWeek &&
+      weekData.unitNumber &&
+      structuredDbf.rawUnitBlocks?.[weekData.unitNumber]) ||
+    stripFrontMatter(input.ders_bilgi_formu || "").slice(0, 24000)
+  ).slice(0, 32000);
+
+  const xmlPayload = `<ders_plani_baglam_paketi>
+<hedef_hafta_ve_ust_bilgiler>
+  <okul_adi>${input.okul_adi || ""}</okul_adi>
+  <egitim_ogretim_yili>${input.egitim_ogretim_yili || ""}</egitim_ogretim_yili>
+  <ders_ismi>${effectiveDers}</ders_ismi>
+  <sinif_duzeyi>${effectiveSinif}</sinif_duzeyi>
+  <hafta_etiketi>${weekData.haftaEtiketi}</hafta_etiketi>
+  <tarih_araligi>${effectiveTarihAraligi}</tarih_araligi>
+  <onay_tarihi>${effectiveOnayTarihi}</onay_tarihi>
+  <dosya_adlari>
+    <yillik_plan_dosya_adi>${input.dosya_adlari?.yillik_plan || ""}</yillik_plan_dosya_adi>
+    <ders_bilgi_formu_dosya_adi>${input.dosya_adlari?.ders_bilgi_formu || ""}</ders_bilgi_formu_dosya_adi>
+    <ders_materyali_dosya_adi>${input.dosya_adlari?.ders_materyali || ""}</ders_materyali_dosya_adi>
+  </dosya_adlari>
+</hedef_hafta_ve_ust_bilgiler>
+
+<yillik_plan baglam="Bu metin Ünitelendirilmiş Yıllık Plandır. Hedeflenen hafta (${weekData.haftaEtiketi}) ve tarih aralığı (${effectiveTarihAraligi}) dikkate alınarak Öğrenme Birimi, Süre, İçerik Çerçevesi ve o hafta/tarih aralığına ait TÜM Öğrenme Çıktıları ve Süreç Bileşenleri (a, b, c, ç, d, e...) eksiksiz alınır.">
+  <secilen_hafta_ogrenme_birimi>${weekData.ogrenmeBirimi}</secilen_hafta_ogrenme_birimi>
+  <secilen_hafta_suresi>${weekData.sure}</secilen_hafta_suresi>
+  <secilen_hafta_icerik_cercevesi>${weekData.icerikCercevesi}</secilen_hafta_icerik_cercevesi>
+  <secilen_hafta_ogrenme_ciktilari_ve_surec_bilesenleri>
+${weekData.formattedOutcomeAndProcessBlock}
+  </secilen_hafta_ogrenme_ciktilari_ve_surec_bilesenleri>
+  <secilen_hafta_ham_kesiti>
+${weekData.rawWeekWindowText}
+  </secilen_hafta_ham_kesiti>
+  <yillik_plan_tam_tablo_metni>
+${cleanYillikTableSlice}
+  </yillik_plan_tam_tablo_metni>
+</yillik_plan>
+
+<ders_bilgi_formu baglam="Bu metin MEB Türkiye Yüzyılı Maarif Modeli resmi Ders Bilgi Formudur. Öğrenme Çıktıları ve Süreç Bileşenlerinin tam cümleleri doğrudan bu etiket içindeki resmi metinlerden birebir alınır. ÖNEMLİ KURAL: 'temel_kabuller_tam_metin', 'on_degerlendirme_sureci_tam_metin' veya 'kopru_kurma_tam_metin' etiketleri boşsa, ASLA 'ders_bilgi_formu_ham_metin' içindeki ders adı, sınıfı, süresi, amacı, eğitim-öğretim ortam ve donanımı gibi genel form kapak bilgilerini bu alanlara kopyalama! Boş olan hazırlık süreçleri için bu haftanın tekil öğrenme birimine ve konusuna uygun pedagojik MEB Maarif cümleleri yaz.">
+  <alan_becerileri>${activeUnitMeta?.alanBecerileri || structuredDbf.alanBecerileri}</alan_becerileri>
+  <egilimler>${activeUnitMeta?.egilimler || structuredDbf.egilimler}</egilimler>
+  <sosyal_duygusal_ogrenme_becerileri>${activeUnitMeta?.sosyalDuygusalBeceriler || structuredDbf.sosyalDuygusalBeceriler}</sosyal_duygusal_ogrenme_becerileri>
+  <degerler>${activeUnitMeta?.degerler || structuredDbf.degerler}</degerler>
+  <okuryazarlik_becerileri>${activeUnitMeta?.okuryazarlikBecerileri || structuredDbf.okuryazarlikBecerileri}</okuryazarlik_becerileri>
+  <disiplinler_arasi_iliski>${activeUnitMeta?.disiplinlerArasiIliski || structuredDbf.disiplinlerArasiIliski}</disiplinler_arasi_iliski>
+  <beceriler_arasi_iliski>${activeUnitMeta?.becerilerArasiIliski || structuredDbf.becerilerArasiIliski}</beceriler_arasi_iliski>
+  <ogrenme_ciktilari_ve_surec_bilesenleri_katalogu>
+${structuredDbf.rawOutcomesCatalogText || ""}
+  </ogrenme_ciktilari_ve_surec_bilesenleri_katalogu>
+  <ogrenme_kanitlari_tam_metin>
+${!isDbfHeaderOrTableNoise(weekData.unitOgrenmeKanitlari || structuredDbf.ogrenmeKanitlari) ? (weekData.unitOgrenmeKanitlari || structuredDbf.ogrenmeKanitlari) : ""}
+  </ogrenme_kanitlari_tam_metin>
+  <temel_kabuller_tam_metin>
+${!isDbfHeaderOrTableNoise(weekData.unitTemelKabuller || structuredDbf.temelKabuller) ? (weekData.unitTemelKabuller || structuredDbf.temelKabuller) : ""}
+  </temel_kabuller_tam_metin>
+  <on_degerlendirme_sureci_tam_metin>
+${!isDbfHeaderOrTableNoise(weekData.unitOnDegerlendirmeSureci || structuredDbf.onDegerlendirmeSureci) ? (weekData.unitOnDegerlendirmeSureci || structuredDbf.onDegerlendirmeSureci) : ""}
+  </on_degerlendirme_sureci_tam_metin>
+  <kopru_kurma_tam_metin>
+${!isDbfHeaderOrTableNoise(weekData.unitKopruKurma || structuredDbf.kopruKurma) ? (weekData.unitKopruKurma || structuredDbf.kopruKurma) : ""}
+  </kopru_kurma_tam_metin>
+  <ogretme_uygulamalari_secilen_birim>
+${weekData.unitOgretmeUygulamalari.join("\n")}
+  </ogretme_uygulamalari_secilen_birim>
+  <farklilastirma_tam_metin>${weekData.unitFarklilastirma || structuredDbf.farklilastirma}</farklilastirma_tam_metin>
+  <aktif_maarif_kodlari>${(activeUnitMeta?.rawActivityCodes && activeUnitMeta.rawActivityCodes.length > 0 ? activeUnitMeta.rawActivityCodes : structuredDbf.rawActivityCodes).join(", ")}</aktif_maarif_kodlari>
+  <ders_bilgi_formu_ham_metin>
+${cleanDbfSlice}
+  </ders_bilgi_formu_ham_metin>
+</ders_bilgi_formu>
+
+<ders_materyali baglam="Bu metin Ders Materyalinin (Ders Kitabı / Modül) seçilen haftadaki süreç bileşenlerine (${weekData.weekSubComponents.join(" ; ")}) ait konu anlatımı kesitidir. Bu etiketten ve seçilen haftanın süreç bileşenlerinden o haftaya özgü 4 maddelik Güdüleme (-acaksınız/-eceksiniz kipinde), 4 soruluk Dikkat Çekme (? ile biten) ve sonunda parantez içi Maarif kodları bulunan 5-6 maddelik Ek Öğretme Uygulamaları üretilir.">
+${materyalSlice}
+</ders_materyali>
+</ders_plani_baglam_paketi>`;
+
+  return {
+    xmlPayload,
+    structuredDbf,
+    weekData,
+    materyalSlice,
+  };
+}
+
+export function buildXmlContextPayload(input: XmlContextPayloadInput): string {
+  return buildXmlContextPayloadWithAnalysis(input).xmlPayload;
+}
+
+export interface ClientSynthesisInput {
+  yillik_plan: string;
+  ders_materyali: string;
+  ders_bilgi_formu?: string;
+  hafta_etiketi?: string;
+  tarih_araligi?: string;
+  ders_ismi?: string;
+  sinif_duzeyi?: string;
+  secilen_hafta_verisi?: YillikPlanWeekItem | null;
+}
+
+export function synthesizePlanClientSide(
+  inputs: ClientSynthesisInput
+): MaarifLessonPlan {
+  const cleanDbf = stripFrontMatter(inputs.ders_bilgi_formu || "");
+  const cleanYillik = stripFrontMatter(inputs.yillik_plan || "");
+  const cleanMateryal = stripFrontMatter(inputs.ders_materyali || "");
+
+  const structuredDbf = parseDersBilgiFormuStructured(
+    cleanDbf,
+    cleanYillik,
+    cleanMateryal
+  );
+  const weekData = extractWeekPlanStructured(
+    cleanYillik,
+    inputs.hafta_etiketi || "1. HAFTA",
+    inputs.tarih_araligi || "",
+    structuredDbf,
+    inputs.secilen_hafta_verisi
+  );
+  const materyalSlice = extractWeekMateryalSlice(
+    cleanMateryal,
+    weekData,
+    9500
+  );
+
+  return sanitizePlanOutputBeforeDelivery(
+    enforceAndMergeLessonPlan(
+      null,
+      structuredDbf,
+      weekData,
+      materyalSlice,
+      {
+        dersIsmi: inputs.ders_ismi,
+        sinifDuzeyi: inputs.sinif_duzeyi,
+      }
+    )
+  );
+}
+
+export function synthesizeAllWeeksClientSide(params: {
+  weeks: YillikPlanWeekItem[];
+  yillik_plan: string;
+  ders_materyali: string;
+  ders_bilgi_formu?: string;
+  baseMeta: DocumentHeaderFooterMeta;
+}): Array<{ plan: MaarifLessonPlan; meta: DocumentHeaderFooterMeta }> {
+  const { weeks, yillik_plan, ders_materyali, ders_bilgi_formu, baseMeta } =
+    params;
+
+  const cleanDbf = stripFrontMatter(ders_bilgi_formu || "");
+  const cleanYillik = stripFrontMatter(yillik_plan || "");
+  const cleanMateryal = stripFrontMatter(ders_materyali || "");
+
+  const detectedDocMeta = extractDocumentMetadataClient(
+    `${cleanDbf}\n${cleanYillik}\n${cleanMateryal}`
+  );
+  const effectiveDersIsmi =
+    baseMeta.dersIsmi.trim() || detectedDocMeta.dersIsmi;
+  const effectiveSinifDuzeyi =
+    baseMeta.sinifDuzeyi.trim() || detectedDocMeta.sinifDuzeyi;
+  const effectiveOkulAdi =
+    baseMeta.okulAdi.trim() || detectedDocMeta.okulAdi;
+
+  const structuredDbf = parseDersBilgiFormuStructured(
+    cleanDbf,
+    cleanYillik,
+    cleanMateryal
+  );
+
+  return weeks.map((weekItem) => {
+    const validDate = resolveValidDateRange(
+      weekItem.tarihAraligi,
+      weekItem.haftaNo
+    );
+    const weekData = extractWeekPlanStructured(
+      cleanYillik,
+      weekItem.haftaEtiketi,
+      validDate,
+      structuredDbf,
+      {
+        ...weekItem,
+        tarihAraligi: validDate,
+      }
+    );
+    const materyalSlice = extractWeekMateryalSlice(
+      cleanMateryal,
+      weekData,
+      6500
+    );
+
+    const plan = enforceAndMergeLessonPlan(
+      null,
+      structuredDbf,
+      weekData,
+      materyalSlice,
+      {
+        dersIsmi: effectiveDersIsmi,
+        sinifDuzeyi: effectiveSinifDuzeyi,
+      }
+    );
+
+    const sanitizedUnit = weekItem.isSpecialWeek
+      ? weekItem.ogrenmeBirimi || "Sosyal Etkinlik Haftası"
+      : sanitizeAndEnforceSingleUnit(
+          weekItem.ogrenmeBirimi || weekData.ogrenmeBirimi,
+          {
+            knownUnits: structuredDbf.unitsByNumber,
+            outcomeHeader: plan.Ogrenme_Ciktilari_ve_Surec_Bilesenleri,
+            outcomeCode: weekData.outcomeCode,
+            icerikCercevesi: weekItem.icerikCercevesi || weekData.icerikCercevesi,
+            weekNo: weekItem.haftaNo,
+          }
+        );
+
+    const repairedTopic = weekItem.isSpecialWeek
+      ? weekItem.icerikCercevesi || sanitizedUnit
+      : repairIncompleteTopic(
+          weekItem.icerikCercevesi || weekData.icerikCercevesi,
+          {
+            rawWeekWindowText: weekData.rawWeekWindowText,
+            yillikPlan: cleanYillik,
+            structuredDbf,
+            outcomeHeader: plan.Ogrenme_Ciktilari_ve_Surec_Bilesenleri,
+            ogrenmeBirimi: sanitizedUnit,
+            weekNo: weekItem.haftaNo,
+          }
+        );
+
+    plan.Ders_Bilgisi.Ogrenme_Birimi = sanitizedUnit;
+    plan.Icerik_Cercevesi = repairedTopic;
+
+    if (weekItem.ogrenmeKanitlari) {
+      plan.Ogrenme_Kanitlari = cleanPdfHeaderFooterNoiseFromField(
+        weekItem.ogrenmeKanitlari
+      );
+    }
+    if (
+      weekItem.ogretmeUygulamalari &&
+      weekItem.ogretmeUygulamalari.length > 0
+    ) {
+      plan.Ogrenme_Ogretme_Yasantilari.Ogretme_Uygulamalari =
+        weekItem.ogretmeUygulamalari
+          .map((b) => cleanPdfHeaderFooterNoiseFromField(b.replace(/^\*\s*/, "").trim()))
+          .filter(Boolean);
+    }
+
+    const sanitizedPlan = sanitizePlanOutputBeforeDelivery(plan, {
+      structuredDbf,
+      cleanDers: effectiveDersIsmi,
+      cleanUnit: sanitizedUnit,
+      cleanTopic: repairedTopic,
+    });
+
+    const weekMeta: DocumentHeaderFooterMeta = {
+      ...baseMeta,
+      okulAdi: effectiveOkulAdi || baseMeta.okulAdi,
+      dersIsmi: effectiveDersIsmi || sanitizedPlan.Ders_Bilgisi.Ders,
+      sinifDuzeyi: effectiveSinifDuzeyi || sanitizedPlan.Ders_Bilgisi.Sinif,
+      haftaEtiketi: weekItem.haftaEtiketi,
+      tarihAraligi: validDate,
+      onayTarihi:
+        weekItem.onayTarihi ||
+        inferApprovalDateClient(validDate) ||
+        baseMeta.onayTarihi,
+    };
+
+    return { plan: sanitizedPlan, meta: weekMeta };
+  });
+}
+
